@@ -16,7 +16,7 @@ COPY go.mod ./
 COPY . .
 
 # Build the binary
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o navplane main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o navplane ./cmd/server
 
 # Runtime stage
 FROM scratch
