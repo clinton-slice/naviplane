@@ -19,12 +19,12 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o navplane ./cmd/server
 
 # Runtime stage
-FROM scratch
+FROM alpine:3.19
 
 WORKDIR /app
 
-# Copy CA certificates for HTTPS
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+# Install ca-certificates and wget for healthcheck
+RUN apk --no-cache add ca-certificates wget
 
 # Copy the binary
 COPY --from=builder /app/navplane .
