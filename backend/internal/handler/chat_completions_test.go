@@ -3,92 +3,19 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"navplane/internal/config"
 )
 
-func TestChatCompletions_ValidRequest(t *testing.T) {
-	// Test: POST with valid JSON and required fields returns 200
-	body := `{
-		"model": "gpt-4",
-		"messages": [
-			{"role": "user", "content": "Hello!"}
-		]
-	}`
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-
-	ChatCompletions(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Errorf("expected status 200, got %d", rec.Code)
-	}
-
-	// Verify Content-Type header
-	contentType := rec.Header().Get("Content-Type")
-	if contentType != "application/json" {
-		t.Errorf("expected Content-Type 'application/json', got '%s'", contentType)
-	}
-
-	// Verify response body
-	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to parse response: %v", err)
-	}
-	if resp["status"] != "ok" {
-		t.Errorf("expected status 'ok', got %v", resp["status"])
-	}
-}
-
-func TestChatCompletions_ValidRequestWithOptionalFields(t *testing.T) {
-	// Test: POST with all optional fields returns 200
-	body := `{
-		"model": "gpt-3.5-turbo",
-		"messages": [
-			{"role": "system", "content": "You are helpful."},
-			{"role": "user", "content": "Hi"}
-		],
-		"stream": false,
-		"temperature": 0.7,
-		"max_tokens": 100,
-		"top_p": 0.9
-	}`
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-
-	ChatCompletions(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Errorf("expected status 200, got %d", rec.Code)
-	}
-}
-
-func TestChatCompletions_ValidRequestWithUnknownFields(t *testing.T) {
-	// Test: POST with unknown fields still returns 200 (unknown fields preserved)
-	body := `{
-		"model": "gpt-4",
-		"messages": [{"role": "user", "content": "Hello"}],
-		"response_format": {"type": "json_object"},
-		"seed": 42,
-		"custom_field": "value"
-	}`
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-
-	ChatCompletions(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Errorf("expected status 200, got %d", rec.Code)
-	}
-}
+// ========================================================================
+// Validation Tests (using ChatCompletions without provider - returns 503 for valid requests)
+// ========================================================================
 
 func TestChatCompletions_InvalidJSON(t *testing.T) {
 	// Test: POST with invalid JSON returns 400
@@ -419,7 +346,8 @@ func TestChatCompletions_MethodNotAllowed_PATCH(t *testing.T) {
 }
 
 func TestChatCompletions_MultipleMessages(t *testing.T) {
-	// Test: POST with multiple messages returns 200
+	// Test: POST with multiple messages passes validation
+	// Note: Without provider config, returns 503 (service unavailable)
 	body := `{
 		"model": "gpt-4",
 		"messages": [
@@ -436,8 +364,9 @@ func TestChatCompletions_MultipleMessages(t *testing.T) {
 
 	ChatCompletions(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Errorf("expected status 200, got %d", rec.Code)
+	// Valid request without provider returns 503
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503, got %d", rec.Code)
 	}
 }
 
@@ -484,3 +413,446 @@ func TestChatCompletions_EmptyBody(t *testing.T) {
 		t.Errorf("expected status 400, got %d", rec.Code)
 	}
 }
+
+func TestChatCompletions_StreamingReturns501(t *testing.T) {
+	// Test: stream: true returns 501 Not Implemented
+	body := `{
+		"model": "gpt-4",
+		"messages": [{"role": "user", "content": "Hello"}],
+		"stream": true
+	}`
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	ChatCompletions(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Errorf("expected status 501, got %d", rec.Code)
+	}
+
+	// Verify Content-Type header
+	contentType := rec.Header().Get("Content-Type")
+	if contentType != "application/json" {
+		t.Errorf("expected Content-Type 'application/json', got '%s'", contentType)
+	}
+
+	// Verify error response
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	errObj, ok := resp["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected error object, got %T", resp["error"])
+	}
+	if errObj["message"] != "streaming not implemented yet" {
+		t.Errorf("expected streaming error message, got %v", errObj["message"])
+	}
+	if errObj["type"] != "not_implemented_error" {
+		t.Errorf("expected error type 'not_implemented_error', got %v", errObj["type"])
+	}
+}
+
+// ========================================================================
+// Integration Tests with Fake Provider
+// ========================================================================
+
+// createTestHandler creates a handler with a fake provider for testing
+func createTestHandler(fakeProviderURL string) http.HandlerFunc {
+	cfg := &config.Config{
+		Port:        "8080",
+		Environment: "test",
+		Provider: config.ProviderConfig{
+			BaseURL: fakeProviderURL,
+			APIKey:  "test-api-key-12345678901234567890",
+		},
+	}
+
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, cfg)
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		mux.ServeHTTP(w, r)
+	}
+}
+
+func TestChatCompletionsHandler_ForwardsToProvider(t *testing.T) {
+	// Create a fake provider that returns a mock completion response
+	fakeProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify the request
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("expected path /v1/chat/completions, got %s", r.URL.Path)
+		}
+
+		// Verify Authorization header is set correctly
+		auth := r.Header.Get("Authorization")
+		if auth != "Bearer test-api-key-12345678901234567890" {
+			t.Errorf("expected correct Authorization header, got %s", auth)
+		}
+
+		// Verify Content-Type
+		if r.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("expected Content-Type application/json, got %s", r.Header.Get("Content-Type"))
+		}
+
+		// Return a mock response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl-test123",
+			"object":  "chat.completion",
+			"created": 1677858242,
+			"model":   "gpt-4",
+			"choices": []map[string]any{
+				{
+					"index": 0,
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": "Hello! How can I help you?",
+					},
+					"finish_reason": "stop",
+				},
+			},
+			"usage": map[string]any{
+				"prompt_tokens":     10,
+				"completion_tokens": 8,
+				"total_tokens":      18,
+			},
+		})
+	}))
+	defer fakeProvider.Close()
+
+	// Create handler with fake provider
+	handler := createTestHandler(fakeProvider.URL)
+
+	// Make request
+	body := `{
+		"model": "gpt-4",
+		"messages": [{"role": "user", "content": "Hello!"}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler(rec, req)
+
+	// Verify response
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", rec.Code)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	if resp["id"] != "chatcmpl-test123" {
+		t.Errorf("expected id 'chatcmpl-test123', got %v", resp["id"])
+	}
+	if resp["object"] != "chat.completion" {
+		t.Errorf("expected object 'chat.completion', got %v", resp["object"])
+	}
+}
+
+func TestChatCompletionsHandler_PreservesProviderStatusCode(t *testing.T) {
+	// Test that provider error status codes are passed through
+	fakeProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": "Rate limit exceeded",
+				"type":    "rate_limit_error",
+			},
+		})
+	}))
+	defer fakeProvider.Close()
+
+	handler := createTestHandler(fakeProvider.URL)
+
+	body := `{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler(rec, req)
+
+	// Verify provider status code is preserved
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("expected status 429, got %d", rec.Code)
+	}
+
+	// Verify response body is passed through
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	errObj := resp["error"].(map[string]any)
+	if errObj["type"] != "rate_limit_error" {
+		t.Errorf("expected error type 'rate_limit_error', got %v", errObj["type"])
+	}
+}
+
+func TestChatCompletionsHandler_DoesNotForwardClientAuth(t *testing.T) {
+	// Test that client Authorization header is NOT forwarded
+	var receivedAuth string
+	fakeProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":      "test",
+			"object":  "chat.completion",
+			"created": 1677858242,
+			"model":   "gpt-4",
+			"choices": []map[string]any{},
+		})
+	}))
+	defer fakeProvider.Close()
+
+	handler := createTestHandler(fakeProvider.URL)
+
+	body := `{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer client-secret-key-should-not-be-forwarded")
+	rec := httptest.NewRecorder()
+
+	handler(rec, req)
+
+	// Verify that the provider received the server's API key, not the client's
+	if receivedAuth == "Bearer client-secret-key-should-not-be-forwarded" {
+		t.Error("client Authorization header was incorrectly forwarded to provider")
+	}
+	if receivedAuth != "Bearer test-api-key-12345678901234567890" {
+		t.Errorf("expected server API key to be used, got %s", receivedAuth)
+	}
+}
+
+func TestChatCompletionsHandler_ForwardsXRequestID(t *testing.T) {
+	// Test that X-Request-ID is forwarded
+	var receivedRequestID string
+	fakeProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedRequestID = r.Header.Get("X-Request-ID")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":      "test",
+			"object":  "chat.completion",
+			"created": 1677858242,
+			"model":   "gpt-4",
+			"choices": []map[string]any{},
+		})
+	}))
+	defer fakeProvider.Close()
+
+	handler := createTestHandler(fakeProvider.URL)
+
+	body := `{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Request-ID", "req-12345")
+	rec := httptest.NewRecorder()
+
+	handler(rec, req)
+
+	if receivedRequestID != "req-12345" {
+		t.Errorf("expected X-Request-ID 'req-12345', got %s", receivedRequestID)
+	}
+}
+
+func TestChatCompletionsHandler_PreservesUnknownFields(t *testing.T) {
+	// Test that unknown fields in the request are forwarded to the provider
+	var receivedBody map[string]any
+	fakeProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		json.Unmarshal(bodyBytes, &receivedBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":      "test",
+			"object":  "chat.completion",
+			"created": 1677858242,
+			"model":   "gpt-4",
+			"choices": []map[string]any{},
+		})
+	}))
+	defer fakeProvider.Close()
+
+	handler := createTestHandler(fakeProvider.URL)
+
+	// Request includes unknown fields
+	body := `{
+		"model": "gpt-4",
+		"messages": [{"role": "user", "content": "Hello"}],
+		"response_format": {"type": "json_object"},
+		"seed": 42,
+		"custom_field": "custom_value"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	// Verify unknown fields were forwarded
+	if receivedBody["custom_field"] != "custom_value" {
+		t.Errorf("expected custom_field 'custom_value', got %v", receivedBody["custom_field"])
+	}
+	if receivedBody["seed"] != float64(42) {
+		t.Errorf("expected seed 42, got %v", receivedBody["seed"])
+	}
+	respFormat, ok := receivedBody["response_format"].(map[string]any)
+	if !ok || respFormat["type"] != "json_object" {
+		t.Errorf("expected response_format.type 'json_object', got %v", receivedBody["response_format"])
+	}
+}
+
+func TestChatCompletionsHandler_StreamingReturns501(t *testing.T) {
+	// Test that stream: true returns 501 even with a valid provider
+	fakeProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("provider should not be called for streaming requests")
+	}))
+	defer fakeProvider.Close()
+
+	handler := createTestHandler(fakeProvider.URL)
+
+	body := `{
+		"model": "gpt-4",
+		"messages": [{"role": "user", "content": "Hello"}],
+		"stream": true
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Errorf("expected status 501, got %d", rec.Code)
+	}
+}
+
+func TestChatCompletionsHandler_ProviderUnavailable(t *testing.T) {
+	// Test that connection failures return 502 Bad Gateway
+	// Use a closed server to simulate connection failure
+	fakeProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	providerURL := fakeProvider.URL
+	fakeProvider.Close() // Close immediately to simulate unavailable provider
+
+	handler := createTestHandler(providerURL)
+
+	body := `{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("expected status 502, got %d", rec.Code)
+	}
+
+	// Verify error response
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	errObj := resp["error"].(map[string]any)
+	if errObj["type"] != "upstream_error" {
+		t.Errorf("expected error type 'upstream_error', got %v", errObj["type"])
+	}
+}
+
+func TestChatCompletionsHandler_PreservesContentType(t *testing.T) {
+	// Test that Content-Type from provider is preserved
+	fakeProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"test"}`))
+	}))
+	defer fakeProvider.Close()
+
+	handler := createTestHandler(fakeProvider.URL)
+
+	body := `{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler(rec, req)
+
+	contentType := rec.Header().Get("Content-Type")
+	if contentType != "application/json; charset=utf-8" {
+		t.Errorf("expected Content-Type 'application/json; charset=utf-8', got '%s'", contentType)
+	}
+}
+
+func TestBuildUpstreamURL(t *testing.T) {
+	tests := []struct {
+		baseURL  string
+		expected string
+	}{
+		{"https://api.openai.com", "https://api.openai.com/v1/chat/completions"},
+		{"https://api.openai.com/", "https://api.openai.com/v1/chat/completions"},
+		{"http://localhost:8080", "http://localhost:8080/v1/chat/completions"},
+		{"http://localhost:8080/", "http://localhost:8080/v1/chat/completions"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.baseURL, func(t *testing.T) {
+			result := BuildUpstreamURL(tt.baseURL)
+			if result != tt.expected {
+				t.Errorf("BuildUpstreamURL(%q) = %q, expected %q", tt.baseURL, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestChatCompletionsHandler_ValidationStillWorks(t *testing.T) {
+	// Test that validation errors are returned before calling provider
+	fakeProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("provider should not be called for invalid requests")
+	}))
+	defer fakeProvider.Close()
+
+	handler := createTestHandler(fakeProvider.URL)
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"missing model", `{"messages": [{"role": "user", "content": "Hello"}]}`},
+		{"empty model", `{"model": "", "messages": [{"role": "user", "content": "Hello"}]}`},
+		{"missing messages", `{"model": "gpt-4"}`},
+		{"empty messages", `{"model": "gpt-4", "messages": []}`},
+		{"missing role", `{"model": "gpt-4", "messages": [{"content": "Hello"}]}`},
+		{"missing content", `{"model": "gpt-4", "messages": [{"role": "user"}]}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+
+			handler(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("expected status 400 for %s, got %d", tt.name, rec.Code)
+			}
+		})
+	}
+}
+
+// Ensure unused imports are used
+var _ = time.Second
