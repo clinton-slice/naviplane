@@ -14,5 +14,5 @@ func RegisterRoutes(mux *http.ServeMux, cfg *config.Config) {
 
 	// OpenAI-compatible API endpoints
 	// Note: We register without method prefix to handle 405 in the handler
-	mux.HandleFunc("/v1/chat/completions", ChatCompletions)
+	mux.HandleFunc("/v1/chat/completions", chatCompletionsHandler(cfg))
 }
