@@ -2,12 +2,14 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"navplane/internal/config"
 )
@@ -323,6 +325,88 @@ func TestChatCompletions_UpstreamUnreachable(t *testing.T) {
 		t.Errorf("expected status 502, got %d", rec.Code)
 	}
 	assertJSONError(t, rec.Body.Bytes(), "failed to reach upstream provider", "server_error")
+}
+
+// --- Client Disconnection Tests ---
+
+func TestChatCompletions_StreamingClientDisconnect(t *testing.T) {
+	cfg := testConfig()
+
+	upstreamCancelled := make(chan struct{})
+	client := mockHTTPClient(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		close(upstreamCancelled)
+		return nil, req.Context().Err()
+	})
+
+	handler := NewChatCompletionsHandlerWithClient(cfg, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	body := `{"stream": true, "model": "gpt-4", "messages": [{"role": "user", "content": "Hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel() // Simulate client disconnect
+	}()
+
+	handler(rec, req)
+
+	select {
+	case <-upstreamCancelled:
+		// Success: upstream request was cancelled
+	case <-time.After(time.Second):
+		t.Error("upstream request was not cancelled when client disconnected")
+	}
+}
+
+// --- URL Normalization Tests ---
+
+func TestChatCompletions_URLNormalization(t *testing.T) {
+	tests := []struct {
+		name        string
+		baseURL     string
+		expectedURL string
+	}{
+		{"no trailing slash", "https://api.openai.com", "https://api.openai.com/v1/chat/completions"},
+		{"trailing slash", "https://api.openai.com/", "https://api.openai.com/v1/chat/completions"},
+		{"includes v1", "https://api.openai.com/v1", "https://api.openai.com/v1/chat/completions"},
+		{"includes v1 with slash", "https://api.openai.com/v1/", "https://api.openai.com/v1/chat/completions"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var capturedURL string
+			client := mockHTTPClient(func(req *http.Request) (*http.Response, error) {
+				capturedURL = req.URL.String()
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(bytes.NewReader([]byte(`{"id":"test"}`))),
+				}, nil
+			})
+
+			cfg := &config.Config{
+				Provider: config.ProviderConfig{
+					BaseURL: tt.baseURL,
+					APIKey:  "test-key",
+				},
+			}
+
+			handler := NewChatCompletionsHandlerWithClient(cfg, client)
+			body := `{"model": "gpt-4", "messages": [{"role": "user", "content": "Hi"}]}`
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+			rec := httptest.NewRecorder()
+
+			handler(rec, req)
+
+			if capturedURL != tt.expectedURL {
+				t.Errorf("expected URL %s, got %s", tt.expectedURL, capturedURL)
+			}
+		})
+	}
 }
 
 // --- Helpers ---

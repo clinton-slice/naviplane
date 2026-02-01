@@ -42,8 +42,12 @@ func newHandler(cfg *config.Config, client *http.Client) *chatCompletionsHandler
 			},
 		}
 	}
+	// Normalize base URL: strip trailing slash and /v1 suffix to avoid duplication
+	baseURL := strings.TrimSuffix(cfg.Provider.BaseURL, "/")
+	baseURL = strings.TrimSuffix(baseURL, "/v1")
+
 	return &chatCompletionsHandler{
-		upstreamURL: strings.TrimSuffix(cfg.Provider.BaseURL, "/") + "/v1/chat/completions",
+		upstreamURL: baseURL + "/v1/chat/completions",
 		apiKey:      cfg.Provider.APIKey,
 		client:      client,
 	}
@@ -163,7 +167,10 @@ func (h *chatCompletionsHandler) handleStreaming(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Set SSE headers
+	// Copy rate limit headers from upstream before setting SSE headers
+	copyRateLimitHeaders(w, upstreamResp)
+
+	// Set SSE headers (these override Content-Type from upstream)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -171,29 +178,19 @@ func (h *chatCompletionsHandler) handleStreaming(w http.ResponseWriter, r *http.
 	flusher.Flush()
 
 	// Stream response body
+	// Note: Context cancellation closes the HTTP connection, causing Read to return an error.
+	// No explicit select needed - the transport layer handles cancellation.
 	buf := make([]byte, 4096)
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
 		n, err := upstreamResp.Body.Read(buf)
 		if n > 0 {
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				return
+				return // Client disconnected
 			}
 			flusher.Flush()
 		}
 		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			if ctx.Err() != nil {
-				return
-			}
-			break
+			break // EOF or error (including context cancellation)
 		}
 	}
 
@@ -233,6 +230,17 @@ func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
 		"Content-Length",
 		"Content-Encoding",
 		"X-Request-Id",
+	}
+	for _, h := range headers {
+		if v := resp.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
+		}
+	}
+	copyRateLimitHeaders(w, resp)
+}
+
+func copyRateLimitHeaders(w http.ResponseWriter, resp *http.Response) {
+	rateLimitHeaders := []string{
 		"X-RateLimit-Limit-Requests",
 		"X-RateLimit-Limit-Tokens",
 		"X-RateLimit-Remaining-Requests",
@@ -240,7 +248,7 @@ func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
 		"X-RateLimit-Reset-Requests",
 		"X-RateLimit-Reset-Tokens",
 	}
-	for _, h := range headers {
+	for _, h := range rateLimitHeaders {
 		if v := resp.Header.Get(h); v != "" {
 			w.Header().Set(h, v)
 		}
